@@ -17,6 +17,7 @@ Usage:
     apple-mail-mcp rebuild    # Force rebuild index
 """
 
+import os
 import sys
 import time
 from collections.abc import Callable
@@ -187,6 +188,22 @@ def _acquire_cli_index_lock(manager: "IndexManager") -> "IndexLock":
     sys.exit(1)
 
 
+def _passive_reason() -> str | None:
+    """Why this instance must not become the index writer, or None."""
+    flag = os.environ.get("APPLE_MAIL_INDEX_PASSIVE", "").strip().lower()
+    if flag in ("1", "true", "yes"):
+        return "APPLE_MAIL_INDEX_PASSIVE is set"
+    try:
+        from .index.disk import find_mail_directory
+
+        next(os.scandir(find_mail_directory()), None)
+    except PermissionError:
+        return "this process cannot read ~/Library/Mail (no Full Disk Access)"
+    except (FileNotFoundError, OSError):
+        return None  # no Mail data: let the normal paths report it
+    return None
+
+
 def _run_serve(watch: bool = False, read_only: bool = False) -> None:
     """Internal function to run the MCP server."""
     import threading
@@ -221,7 +238,20 @@ def _run_serve(watch: bool = False, read_only: bool = False) -> None:
     # block — it is held for the process lifetime (the frame stays
     # alive while mcp.run() blocks below).
     index_lock = IndexLock(manager.db_path)
-    is_writer = index_lock.try_acquire()
+    # Only a process that can actually read ~/Library/Mail may become the
+    # index writer. Otherwise an instance without Full Disk Access (e.g. one
+    # launched by Claude Desktop, which disclaims TCC responsibility for its
+    # MCP servers) wins the lock, can never sync, and starves every capable
+    # instance (#130). APPLE_MAIL_INDEX_PASSIVE=1 forces passive mode.
+    passive_reason = _passive_reason()
+    is_writer = False if passive_reason else index_lock.try_acquire()
+    if passive_reason:
+        print(
+            f"Running index-passive: {passive_reason}. Search uses the "
+            "existing index; another instance keeps it up to date.",
+            file=sys.stderr,
+            flush=True,
+        )
 
     if manager.has_index():
 
@@ -279,6 +309,8 @@ def _run_serve(watch: bool = False, read_only: bool = False) -> None:
                 file=sys.stderr,
                 flush=True,
             )
+        elif passive_reason:
+            manager.index_writer = False
         else:
             manager.index_writer = False
             interval = get_lock_retry_seconds()
